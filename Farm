@@ -1,0 +1,648 @@
+-- Farm.lua — Plant, Harvest, Sell, Payung, Tool helpers
+-- Return function yang terima Core + Notif
+
+return function(Core, Notif)
+    local Players = game:GetService("Players")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local TutorialRemotes = ReplicatedStorage.Remotes.TutorialRemotes
+    local LocalPlayer = Players.LocalPlayer
+
+    local FM = {}
+    FM.isRaining = false
+    FM.scriptControllingPayung = false
+    FM.payungPaused = false
+    FM.lastHarvestCount = 0
+    FM.lastPlantCount = 0
+
+    local AREA_SIZE = Vector3.new(24.35678482055664, 0.5, 24.546669006347656)
+
+    local loopActive = {
+        plant = false, harvest = false, sell = false,
+        rain = false, buySeeds = false,
+    }
+
+    -- ========== HELPERS ==========
+    local function SafeCall(f) return pcall(f) end
+
+    function FM.GetAreaTanamCenter()
+        local center = nil
+        pcall(function()
+            local area = workspace:FindFirstChild("AreaTanam")
+            if not area then return end
+            if area:IsA("BasePart") then
+                center = area.Position
+            elseif area:IsA("Model") then
+                if area.PrimaryPart then
+                    center = area.PrimaryPart.Position
+                else
+                    center = area:GetBoundingBox().Position
+                end
+            end
+        end)
+        return center
+    end
+
+    function FM.GetRandomPlantPosition()
+        local center = FM.GetAreaTanamCenter()
+        if not center then return nil end
+        local halfX, halfZ = AREA_SIZE.X / 2, AREA_SIZE.Z / 2
+        return Vector3.new(
+            center.X + (math.random() * AREA_SIZE.X - halfX),
+            center.Y,
+            center.Z + (math.random() * AREA_SIZE.Z - halfZ)
+        )
+    end
+
+    function FM.GetCurrentPosition()
+        local pos = nil
+        SafeCall(function()
+            local c = LocalPlayer.Character
+            if c and c:FindFirstChild("HumanoidRootPart") then
+                pos = c.HumanoidRootPart.Position
+            end
+        end)
+        return pos
+    end
+
+    function FM.IsNearPosition(targetPos, threshold)
+        threshold = threshold or 15
+        local pos = FM.GetCurrentPosition()
+        if not pos then return false end
+        return (pos - targetPos).Magnitude <= threshold
+    end
+
+    function FM.IsNearFarm(threshold)
+        local farmPos = FM.GetAreaTanamCenter()
+        if not farmPos then return false end
+        return FM.IsNearPosition(farmPos, threshold or 15)
+    end
+
+    function FM.TeleportTo(pos)
+        if not pos then return false end
+        SafeCall(function()
+            local c = LocalPlayer.Character
+            if c and c:FindFirstChild("HumanoidRootPart") then
+                c.HumanoidRootPart.CFrame = CFrame.new(pos.X, pos.Y + 3, pos.Z)
+            end
+        end)
+        return true
+    end
+
+    function FM.TeleportToFarm()
+        local pos = FM.GetAreaTanamCenter()
+        if pos then FM.TeleportTo(pos) end
+    end
+
+    function FM.SmartTeleportToFarm()
+        if FM.IsNearFarm(15) then return false end
+        FM.TeleportToFarm()
+        return true
+    end
+
+    -- ========== TOOL FUNCTIONS ==========
+    function FM.IsToolEquipped(name)
+        local c = LocalPlayer.Character
+        if not c then return false end
+        local nameLower = name:lower()
+        for _, t in ipairs(c:GetChildren()) do
+            if t:IsA("Tool") and (t.Name == name or t.Name:lower():find(nameLower, 1, true)) then return true end
+        end
+        return false
+    end
+
+    function FM.HasTool(name)
+        if FM.IsToolEquipped(name) then return true end
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        if not bp then return false end
+        local nameLower = name:lower()
+        for _, t in ipairs(bp:GetChildren()) do
+            if t:IsA("Tool") and (t.Name == name or t.Name:lower():find(nameLower, 1, true)) then return true end
+        end
+        return false
+    end
+
+    function FM.EquipTool(name)
+        SafeCall(function()
+            local c = LocalPlayer.Character
+            if not c then return end
+            local hum = c:FindFirstChildOfClass("Humanoid")
+            if not hum then return end
+            local bp = LocalPlayer:FindFirstChild("Backpack")
+            if not bp then return end
+            local tool = bp:FindFirstChild(name)
+            if not tool then
+                local nameLower = name:lower()
+                for _, t in ipairs(bp:GetChildren()) do
+                    if t:IsA("Tool") and t.Name:lower():find(nameLower, 1, true) then
+                        tool = t; break
+                    end
+                end
+            end
+            if tool then hum:EquipTool(tool) end
+        end)
+    end
+
+    function FM.UnequipTools()
+        SafeCall(function()
+            local c = LocalPlayer.Character
+            if c then
+                local hum = c:FindFirstChildOfClass("Humanoid")
+                if hum then hum:UnequipTools() end
+            end
+        end)
+    end
+
+    function FM.FindBibitInBackpack(name)
+        local c = LocalPlayer.Character
+        local nameLower = name:lower()
+        if c then
+            for _, t in ipairs(c:GetChildren()) do
+                if t:IsA("Tool") and (t.Name == name or t.Name:lower():find(nameLower, 1, true)) then
+                    return t.Name, "equipped"
+                end
+            end
+        end
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        if bp then
+            for _, t in ipairs(bp:GetChildren()) do
+                if t:IsA("Tool") and (t.Name == name or t.Name:lower():find(nameLower, 1, true)) then
+                    return t.Name, "backpack"
+                end
+            end
+        end
+        return nil, nil
+    end
+
+    function FM.EquipBibit(seedName)
+        local found, loc = FM.FindBibitInBackpack(seedName)
+        if found then
+            if loc == "equipped" then return true end
+            FM.UnequipTools(); task.wait(0.02)
+            FM.EquipTool(found); task.wait(0.02)
+            return FM.IsToolEquipped(found)
+        end
+        return false
+    end
+
+    -- ========== PAYUNG ==========
+    function FM.AnyLoopActive()
+        for _, v in pairs(loopActive) do if v then return true end end
+        return false
+    end
+
+    function FM.EquipPayungFast()
+        SafeCall(function()
+            local c = LocalPlayer.Character
+            if not c then return end
+            if c:FindFirstChild("Payung") then return end
+            local bp = LocalPlayer:FindFirstChild("Backpack")
+            if bp and bp:FindFirstChild("Payung") then
+                local hum = c:FindFirstChildOfClass("Humanoid")
+                if hum then hum:EquipTool(bp:FindFirstChild("Payung")) end
+            end
+        end)
+    end
+
+    function FM.ForcePayungEquip()
+        if not FM.isRaining then return end
+        for _ = 1, 3 do
+            FM.EquipPayungFast()
+            task.wait(0.05)
+            if FM.IsToolEquipped("Payung") then return true end
+        end
+        return FM.IsToolEquipped("Payung")
+    end
+
+    function FM.ForceReleasePayungState()
+        FM.scriptControllingPayung = false
+        FM.payungPaused = false
+    end
+
+    function FM.DoActionWithPayungProtection(actionFunc)
+        FM.scriptControllingPayung = true
+        FM.payungPaused = true
+        if FM.IsToolEquipped("Payung") then FM.UnequipTools(); task.wait(0.02) end
+        local result = actionFunc()
+        FM.UnequipTools(); task.wait(0.02)
+        FM.payungPaused = false
+        if FM.isRaining and Core.Config.AutoRain then FM.ForcePayungEquip() end
+        FM.scriptControllingPayung = false
+        return result
+    end
+
+    -- Rain sync
+    pcall(function()
+        TutorialRemotes.RainSync.OnClientEvent:Connect(function(r)
+            FM.isRaining = r
+            if Core.Config.AutoRain and not FM.AnyLoopActive() and not FM.scriptControllingPayung and not FM.payungPaused then
+                if r then
+                    local c = LocalPlayer.Character
+                    local holdingOther = false
+                    if c then
+                        for _, t in ipairs(c:GetChildren()) do
+                            if t:IsA("Tool") and t.Name ~= "Payung" then holdingOther = true; break end
+                        end
+                    end
+                    if not holdingOther then FM.EquipPayungFast() end
+                else
+                    task.wait(0.1)
+                    if not FM.scriptControllingPayung and not FM.AnyLoopActive() then FM.UnequipTools() end
+                end
+            end
+        end)
+    end)
+
+    -- ========== CROP DETECTION ==========
+    local HarvestKeywords = {"panen","harvest","collect","pick","reap","gather","tuai","take"}
+    local ReadyKeywords = {"siap","matang","ready","sudah","ripe","done","grown","mature","finished","sedia","masak"}
+    local NotReadyKeywords = {"growing","tumbuh","belum","not ready","wait","tunggu","semai","seedling","planted"}
+
+    local function ContainsAny(str, keywords)
+        if not str or str == "" then return false end
+        local lower = str:lower()
+        for _, kw in ipairs(keywords) do
+            if lower:find(kw:lower(), 1, true) then return true end
+        end
+        return false
+    end
+    FM.ContainsAny = ContainsAny
+
+    local function IsHarvestPrompt(prompt)
+        if not prompt then return false end
+        local actionText = prompt.ActionText or ""
+        local objectText = prompt.ObjectText or ""
+        if ContainsAny(actionText, HarvestKeywords) then
+            if actionText ~= "" then return true end
+        end
+        for _, b in ipairs(Core.BibitList) do
+            if objectText:lower():find(b.crop:lower(), 1, true) then
+                if ContainsAny(actionText, HarvestKeywords) then return true end
+            end
+        end
+        return false
+    end
+
+    local function IsCropReady(prompt)
+        if not prompt then return false end
+        local objectText = prompt.ObjectText or ""
+        local actionText = prompt.ActionText or ""
+        if ContainsAny(objectText, NotReadyKeywords) or ContainsAny(actionText, NotReadyKeywords) then return false end
+        if ContainsAny(objectText, ReadyKeywords) or ContainsAny(actionText, ReadyKeywords) then return true end
+        if ContainsAny(actionText, HarvestKeywords) then return true end
+        return false
+    end
+
+    local function IsSawitPrompt(prompt)
+        if not prompt then return false end
+        local ot = (prompt.ObjectText or ""):lower()
+        local at = (prompt.ActionText or ""):lower()
+        return ot:find("sawit", 1, true) ~= nil or ot:find("palm", 1, true) ~= nil or at:find("sawit", 1, true) ~= nil
+    end
+    FM.IsSawitPrompt = IsSawitPrompt
+
+    local function MatchesCrop(prompt, cropName)
+        if not prompt or not cropName then return false end
+        local ot = (prompt.ObjectText or ""):lower()
+        local cl = cropName:lower()
+        return ot:find(cl, 1, true) ~= nil or ot:find("bibit " .. cl, 1, true) ~= nil
+    end
+
+    -- ========== CROP CACHE ==========
+    FM.CropCache = {
+        allReadyPrompts = {}, allReadyCount = 0, totalAll = 0,
+        filteredReady = {}, filteredReadyCount = 0,
+        readySawit = {}, readySawitCount = 0, totalSawit = 0,
+        readyCrops = {}, readyCropCount = 0, totalCrops = 0,
+        lastUpdate = 0, dirty = true,
+    }
+
+    function FM.InvalidateCache() FM.CropCache.dirty = true end
+
+    function FM.RefreshCropCache()
+        local C = FM.CropCache
+        local now = tick()
+        if now - C.lastUpdate < 1.0 and not C.dirty then return end
+        C.lastUpdate = now; C.dirty = false
+
+        local ar, arc, ta = {}, 0, 0
+        local fr, frc = {}, 0
+        local rs, rsc, ts = {}, 0, 0
+        local rc, rcc, tc = {}, 0, 0
+        local selectedCrop = Core.Config.SelectedCrop
+
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("ProximityPrompt") and IsHarvestPrompt(obj) then
+                local isReady = IsCropReady(obj)
+                local isSawit = IsSawitPrompt(obj)
+                ta = ta + 1
+                if isReady then arc = arc + 1; table.insert(ar, obj) end
+                if isSawit then
+                    ts = ts + 1
+                    if isReady then rsc = rsc + 1; table.insert(rs, obj) end
+                else
+                    tc = tc + 1
+                    if isReady then rcc = rcc + 1; table.insert(rc, obj) end
+                end
+                if MatchesCrop(obj, selectedCrop) and isReady then
+                    frc = frc + 1; table.insert(fr, obj)
+                end
+            end
+        end
+
+        C.allReadyPrompts, C.allReadyCount, C.totalAll = ar, arc, ta
+        C.filteredReady, C.filteredReadyCount = fr, frc
+        C.readySawit, C.readySawitCount, C.totalSawit = rs, rsc, ts
+        C.readyCrops, C.readyCropCount, C.totalCrops = rc, rcc, tc
+    end
+
+    -- ========== ACTIVE CROPS ==========
+    function FM.GetPhaseModelName(cropModel)
+        if not cropModel then return nil end
+        local result = nil
+        pcall(function()
+            local attr = cropModel:GetAttribute("PhaseModelName")
+            if attr and type(attr) == "string" and attr ~= "" then result = attr end
+        end)
+        if result then return result end
+        pcall(function()
+            for _, child in ipairs(cropModel:GetDescendants()) do
+                if child.Name == "PhaseModelName" then
+                    if child:IsA("StringValue") then result = child.Value
+                    elseif child:IsA("ObjectValue") and child.Value then result = child.Value.Name end
+                    if result then return end
+                end
+                local attr
+                pcall(function() attr = child:GetAttribute("PhaseModelName") end)
+                if attr and type(attr) == "string" and attr ~= "" then result = attr; return end
+            end
+        end)
+        return result
+    end
+
+    function FM.CountActiveCrops()
+        local total, regular, sawit = 0, 0, 0
+        local details, sawitModels = {}, {}
+        local sawitPhase = nil
+
+        pcall(function()
+            local activeCrops = workspace:FindFirstChild("ActiveCrops")
+            if not activeCrops then return end
+            for _, cropModel in ipairs(activeCrops:GetChildren()) do
+                total = total + 1
+                local pmn = FM.GetPhaseModelName(cropModel)
+                local checkName = pmn or cropModel.Name
+                local checkLower = checkName:lower()
+                local isSawit = checkLower:find("sawit", 1, true) or checkLower:find("palm", 1, true)
+                details[checkName] = (details[checkName] or 0) + 1
+                if isSawit then
+                    sawit = sawit + 1
+                    table.insert(sawitModels, cropModel)
+                    local fNum = checkLower:match("fase(%d+)") or checkLower:match("phase(%d+)") or checkLower:match("_(%d+)$")
+                    local fn = fNum and tonumber(fNum) or 0
+                    if not sawitPhase or fn > sawitPhase then sawitPhase = fn end
+                else
+                    regular = regular + 1
+                end
+            end
+        end)
+
+        return {
+            total = total, regular = regular, sawit = sawit,
+            details = details, sawitModels = sawitModels, sawitPhase = sawitPhase,
+        }
+    end
+
+    -- ========== FIRE PROMPT ==========
+    function FM.FirePrompt(prompt)
+        local success = false
+        SafeCall(function()
+            local oldHold = prompt.HoldDuration
+            local oldDist = prompt.MaxActivationDistance
+            prompt.HoldDuration = 0
+            prompt.MaxActivationDistance = 9999
+            fireproximityprompt(prompt)
+            prompt.HoldDuration = oldHold
+            prompt.MaxActivationDistance = oldDist
+            success = true
+        end)
+        if not success then
+            SafeCall(function()
+                prompt.HoldDuration = 0
+                prompt.MaxActivationDistance = 9999
+                fireproximityprompt(prompt, 0)
+                success = true
+            end)
+        end
+        return success
+    end
+
+    -- ========== HARVEST ==========
+    function FM.SmartHarvest(promptList)
+        if #promptList == 0 then return 0 end
+        local harvested = 0
+        FM.DoActionWithPayungProtection(function()
+            for _, prompt in ipairs(promptList) do
+                if FM.FirePrompt(prompt) then harvested = harvested + 1 end
+                task.wait(0.02)
+            end
+            return harvested
+        end)
+        FM.lastHarvestCount = harvested
+        FM.InvalidateCache()
+        return harvested
+    end
+
+    function FM.HarvestAll()
+        FM.RefreshCropCache()
+        return FM.SmartHarvest(FM.CropCache.allReadyPrompts)
+    end
+
+    function FM.HarvestFiltered()
+        FM.RefreshCropCache()
+        return FM.SmartHarvest(FM.CropCache.filteredReady)
+    end
+
+    function FM.HarvestRegularOnly()
+        FM.RefreshCropCache()
+        return FM.SmartHarvest(FM.CropCache.readyCrops)
+    end
+
+    function FM.HarvestSawitOnly()
+        FM.RefreshCropCache()
+        return FM.SmartHarvest(FM.CropCache.readySawit)
+    end
+
+    -- ========== PLANT ==========
+    function FM.SpeedPlantN(count, seedName)
+        seedName = seedName or Core.Config.SelectedSeed
+        local delay = FM.isRaining and Core.Config.RainPlantDelay or Core.Config.PlantDelay
+        local planted = 0
+        if count <= 0 then return 0 end
+
+        FM.DoActionWithPayungProtection(function()
+            if FM.EquipBibit(seedName) then
+                for i = 1, count do
+                    if not FM.IsToolEquipped(seedName) then
+                        local f = FM.FindBibitInBackpack(seedName)
+                        if f then FM.EquipTool(f); task.wait(0.01) else break end
+                    end
+                    local randomPos = FM.GetRandomPlantPosition()
+                    if randomPos then
+                        SafeCall(function() TutorialRemotes.PlantCrop:FireServer(randomPos) end)
+                        planted = planted + 1
+                    end
+                    if i < count then task.wait(delay) end
+                end
+            end
+            return planted
+        end)
+        FM.lastPlantCount = planted
+        FM.InvalidateCache()
+        return planted
+    end
+
+    -- ========== SELL ==========
+    function FM.GetAllCropCounts()
+        local counts = {}
+        SafeCall(function()
+            local ls = LocalPlayer:FindFirstChild("leaderstats")
+            if not ls then return end
+            local panen = ls:FindFirstChild("Panen")
+            if panen then
+                if panen:IsA("Folder") or panen:IsA("Configuration") then
+                    for _, ch in ipairs(panen:GetChildren()) do
+                        if ch:IsA("ValueBase") and ch.Value > 0 then counts[ch.Name] = ch.Value end
+                    end
+                elseif panen:IsA("ValueBase") and panen.Value > 0 then
+                    counts[Core.Config.SelectedCrop] = panen.Value
+                end
+            end
+            for _, bi in ipairs(Core.BibitList) do
+                local c = ls:FindFirstChild(bi.crop)
+                if c and c:IsA("ValueBase") and c.Value > 0 then counts[bi.crop] = c.Value end
+            end
+            if next(counts) == nil then
+                for _, ch in ipairs(ls:GetChildren()) do
+                    if ch:IsA("ValueBase") and ch.Value > 0
+                       and ch.Name ~= "Coins" and ch.Name ~= "Level"
+                       and ch.Name ~= "XP" and ch.Name ~= "Uang" then
+                        for _, bi in ipairs(Core.BibitList) do
+                            if ch.Name == bi.crop then counts[ch.Name] = ch.Value; break end
+                        end
+                    end
+                end
+            end
+        end)
+        return counts
+    end
+
+    function FM.TrySell(cropName, amount)
+        if not cropName or not amount or amount <= 0 then return false end
+        local success = false
+        pcall(function() TutorialRemotes.RequestSell:InvokeServer("SELL", cropName, amount); success = true end)
+        if not success then
+            pcall(function() TutorialRemotes.RequestSell:InvokeServer(cropName, amount); success = true end)
+        end
+        return success
+    end
+
+    function FM.SellAllCrops()
+        local counts = FM.GetAllCropCounts()
+        local total, sold = 0, {}
+        for cn, am in pairs(counts) do
+            if FM.TrySell(cn, am) then total = total + am; table.insert(sold, cn .. " x" .. am) end
+            task.wait(0.05)
+        end
+        return total, sold
+    end
+
+    function FM.SellAllSawit()
+        local success = false
+        pcall(function() TutorialRemotes.RequestSell:InvokeServer("SELL_ALL_SAWIT"); success = true end)
+        return success
+    end
+
+    function FM.BuyBibit(bibitName, amount)
+        local s = false
+        pcall(function() TutorialRemotes.RequestShop:InvokeServer("BUY", bibitName or Core.Config.SelectedSeed, amount or Core.Config.SeedAmount); s = true end)
+        return s
+    end
+
+    -- ========== SAWIT PLANT ==========
+    function FM.PlantSawitAtPos(pos)
+        if not pos then return "NO_POS" end
+        Notif.landAlreadyHasCrop = false
+        Notif.sawitLandHasCrop = false
+        if not FM.FindBibitInBackpack("Bibit Sawit") then return "NO_BIBIT" end
+
+        FM.scriptControllingPayung = true
+        FM.payungPaused = true
+        if FM.IsToolEquipped("Payung") then FM.UnequipTools(); task.wait(0.05) end
+        if not FM.EquipBibit("Bibit Sawit") then
+            FM.payungPaused = false; FM.scriptControllingPayung = false
+            if FM.isRaining and Core.Config.AutoRain then FM.ForcePayungEquip() end
+            return "NO_BIBIT"
+        end
+        task.wait(0.1)
+        if not FM.IsToolEquipped("Bibit Sawit") then FM.EquipTool("Bibit Sawit"); task.wait(0.1) end
+        SafeCall(function() TutorialRemotes.PlantLahanCrop:FireServer(pos) end)
+        task.wait(0.5)
+        FM.UnequipTools(); task.wait(0.05)
+        FM.payungPaused = false
+        if FM.isRaining and Core.Config.AutoRain then FM.ForcePayungEquip() end
+        FM.scriptControllingPayung = false
+
+        if Notif.landAlreadyHasCrop or Notif.sawitLandHasCrop then
+            Notif.sawitLandOccupied = true
+            Notif.sawitLandHasCrop = true
+            return "OCCUPIED"
+        end
+        return "PLANTED"
+    end
+
+    -- ========== AUTO LOOPS (Farm Tab) ==========
+    function FM.AutoRainLoop()
+        if loopActive.rain then return end
+        loopActive.rain = true
+        while Core.Config.AutoRain do
+            SafeCall(function()
+                if not FM.AnyLoopActive() and not FM.scriptControllingPayung and not FM.payungPaused then
+                    if FM.isRaining and not FM.IsToolEquipped("Payung") then
+                        local c = LocalPlayer.Character
+                        local holdingOther = false
+                        if c then
+                            for _, t in ipairs(c:GetChildren()) do
+                                if t:IsA("Tool") and t.Name ~= "Payung" then holdingOther = true; break end
+                            end
+                        end
+                        if not holdingOther then FM.EquipPayungFast() end
+                    elseif not FM.isRaining and FM.IsToolEquipped("Payung") then
+                        FM.UnequipTools()
+                    end
+                end
+            end)
+            task.wait(0.3)
+        end
+        SafeCall(function()
+            if not FM.AnyLoopActive() and not FM.payungPaused then
+                if FM.IsToolEquipped("Payung") then FM.UnequipTools() end
+            end
+        end)
+        loopActive.rain = false
+    end
+
+    -- Expose loop state for external modules
+    FM.loopActive = loopActive
+
+    -- Anti-AFK
+    pcall(function()
+        local VU = game:GetService("VirtualUser")
+        LocalPlayer.Idled:Connect(function()
+            VU:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+            task.wait(1)
+            VU:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+        end)
+    end)
+
+    return FM
+end
